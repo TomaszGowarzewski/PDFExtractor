@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="PDFAnalyzer.App/PDFAnalyzer.App.csproj" />
+  <Project Path="PDFAnalyzer.Tests/PDFAnalyzer.Tests.csproj" />
+</Solution>
