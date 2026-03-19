@@ -56,7 +56,7 @@ public class PdfDataExtractor
 
     private void PostProcess(ExtractedDocument document)
     {
-        // First pass: clean up individual tables
+        // Phase 1: Per-page table cleanup
         foreach (var page in document.Pages)
         {
             foreach (var element in page.Elements.OfType<ExtractedTable>().ToList())
@@ -65,24 +65,30 @@ public class PdfDataExtractor
                 MergeMultiLineHeaders(element);
                 RemoveEmptyColumns(element);
             }
+
+            MergeHeaderOnlyTables(page);
         }
 
-        // Remove footer/header rows embedded in tables (cross-page detection)
+        // Phase 2: Remove embedded footers (needs cross-page comparison)
         RemoveEmbeddedFooterRows(document);
 
+        // Phase 3: Absorb orphan TextBlocks into adjacent tables (wrapped cell overflow)
+        AbsorbOrphanTextBlocks(document);
+
+        // Phase 4: Cross-page table merge (BEFORE inherited detection!)
+        MergeCrossPageTables(document);
+
+        // Phase 5: Per-page structure detection (now on fully merged tables)
         foreach (var page in document.Pages)
         {
+            // Re-clean merged tables (remove empty cols that appeared after cross-page merge)
+            foreach (var table in page.Elements.OfType<ExtractedTable>().ToList())
+            {
+                RemoveEmptyColumns(table);
+            }
 
-            // Merge header-only tables with their following data table
-            MergeHeaderOnlyTables(page);
-
-            // Merge consecutive KV groups that belong to the same section
             MergeConsecutiveKeyValueGroups(page);
-
-            // Merge consecutive text blocks
             MergeConsecutiveTextBlocks(page);
-
-            // Detect inherited-row tables and convert them
             DetectInheritedTables(page);
 
             // Remove empties
@@ -96,8 +102,90 @@ public class PdfDataExtractor
                 e is ExtractedFormGrid fg && fg.Cells.Count == 0);
         }
 
-        MergeCrossPageTables(document);
         MergeCrossPageKeyValueGroups(document);
+    }
+
+    /// <summary>
+    /// Absorb orphan TextBlocks that sit between table fragments.
+    /// These are typically wrapped cell text that overflowed from the last row
+    /// of the preceding table (e.g., "QWEQWEE,\nQWEQWE" between page breaks).
+    /// Also handles text blocks at the START of a page that belong to the
+    /// last table on the previous page.
+    /// </summary>
+    private static void AbsorbOrphanTextBlocks(ExtractedDocument document)
+    {
+        // Within each page: absorb TextBlocks between two tables
+        foreach (var page in document.Pages)
+        {
+            for (int i = page.Elements.Count - 2; i >= 0; i--)
+            {
+                if (page.Elements[i] is ExtractedTable table &&
+                    i + 1 < page.Elements.Count &&
+                    page.Elements[i + 1] is ExtractedTextBlock textBlock)
+                {
+                    // Check if next element after the text is also a table
+                    bool nextIsTable = i + 2 < page.Elements.Count &&
+                                       page.Elements[i + 2] is ExtractedTable;
+
+                    // Short text between tables = wrapped cell overflow
+                    string text = textBlock.Text.Trim();
+                    if (text.Length < 100 && table.Rows.Count > 0)
+                    {
+                        // Append to the last cell of the last row
+                        var lastRow = table.Rows[^1];
+                        int lastNonEmptyCol = -1;
+                        for (int c = lastRow.Count - 1; c >= 0; c--)
+                        {
+                            if (!string.IsNullOrWhiteSpace(lastRow[c]))
+                            {
+                                lastNonEmptyCol = c;
+                                break;
+                            }
+                        }
+
+                        if (lastNonEmptyCol >= 0)
+                        {
+                            lastRow[lastNonEmptyCol] += "\n" + text;
+                            page.Elements.RemoveAt(i + 1);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Across pages: TextBlock at start of page → append to last table on previous page
+        for (int p = 1; p < document.Pages.Count; p++)
+        {
+            var prevPage = document.Pages[p - 1];
+            var curPage = document.Pages[p];
+
+            if (curPage.Elements.Count == 0) continue;
+            if (curPage.Elements[0] is not ExtractedTextBlock tb) continue;
+
+            // Find last table on previous page
+            var lastTable = prevPage.Elements.OfType<ExtractedTable>().LastOrDefault();
+            if (lastTable == null || lastTable.Rows.Count == 0) continue;
+
+            string text = tb.Text.Trim();
+            if (text.Length >= 100) continue; // too long, probably real content
+
+            var lastRow = lastTable.Rows[^1];
+            int lastCol = -1;
+            for (int c = lastRow.Count - 1; c >= 0; c--)
+            {
+                if (!string.IsNullOrWhiteSpace(lastRow[c]))
+                {
+                    lastCol = c;
+                    break;
+                }
+            }
+
+            if (lastCol >= 0)
+            {
+                lastRow[lastCol] += "\n" + text;
+                curPage.Elements.RemoveAt(0);
+            }
+        }
     }
 
     /// <summary>
