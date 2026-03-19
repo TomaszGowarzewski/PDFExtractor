@@ -56,15 +56,22 @@ public class PdfDataExtractor
 
     private void PostProcess(ExtractedDocument document)
     {
+        // First pass: clean up individual tables
         foreach (var page in document.Pages)
         {
-            // Clean up tables: merge multi-line headers, remove empty columns
             foreach (var element in page.Elements.OfType<ExtractedTable>().ToList())
             {
                 MergeWrappedCellRows(element);
                 MergeMultiLineHeaders(element);
                 RemoveEmptyColumns(element);
             }
+        }
+
+        // Remove footer/header rows embedded in tables (cross-page detection)
+        RemoveEmbeddedFooterRows(document);
+
+        foreach (var page in document.Pages)
+        {
 
             // Merge header-only tables with their following data table
             MergeHeaderOnlyTables(page);
@@ -532,6 +539,94 @@ public class PdfDataExtractor
     ///
     /// Runs iteratively so tables spanning 3+ pages get fully merged.
     /// </summary>
+
+    /// <summary>
+    /// Detect and remove footer/header text that got embedded as last/first rows of tables.
+    /// Works by finding text patterns that repeat in the same position across multiple pages.
+    /// E.g., "Dokument taki sraki i owaki" + page number as the last row of every page's table.
+    /// </summary>
+    private void RemoveEmbeddedFooterRows(ExtractedDocument document)
+    {
+        if (document.Pages.Count < 2) return;
+
+        // Collect fingerprints of last rows across all pages
+        var lastRowFingerprints = new Dictionary<string, int>();
+        var firstRowFingerprints = new Dictionary<string, int>();
+
+        foreach (var page in document.Pages)
+        {
+            foreach (var table in page.Elements.OfType<ExtractedTable>())
+            {
+                if (table.Rows.Count > 0)
+                {
+                    string lastFp = RowFingerprint(table.Rows[^1]);
+                    if (!string.IsNullOrWhiteSpace(lastFp))
+                        lastRowFingerprints[lastFp] = lastRowFingerprints.GetValueOrDefault(lastFp) + 1;
+
+                    if (table.Rows.Count > 1)
+                    {
+                        string firstFp = RowFingerprint(table.Rows[0]);
+                        if (!string.IsNullOrWhiteSpace(firstFp))
+                            firstRowFingerprints[firstFp] = firstRowFingerprints.GetValueOrDefault(firstFp) + 1;
+                    }
+                }
+            }
+        }
+
+        // Rows appearing in 40%+ of pages at the same position are likely footers/headers
+        double threshold = document.Pages.Count * 0.40;
+
+        var footerPatterns = lastRowFingerprints
+            .Where(kv => kv.Value >= threshold)
+            .Select(kv => kv.Key)
+            .ToHashSet();
+
+        var headerPatterns = firstRowFingerprints
+            .Where(kv => kv.Value >= threshold)
+            .Select(kv => kv.Key)
+            .ToHashSet();
+
+        // Remove matching rows
+        foreach (var page in document.Pages)
+        {
+            foreach (var table in page.Elements.OfType<ExtractedTable>())
+            {
+                if (table.Rows.Count > 0 && footerPatterns.Contains(RowFingerprint(table.Rows[^1])))
+                    table.Rows.RemoveAt(table.Rows.Count - 1);
+
+                if (table.Rows.Count > 0 && headerPatterns.Contains(RowFingerprint(table.Rows[0])))
+                    table.Rows.RemoveAt(0);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Create a fingerprint of a row for cross-page comparison.
+    /// Replaces page numbers with placeholder, normalizes whitespace.
+    /// A footer row typically has mostly empty cells with one text cell + one number.
+    /// </summary>
+    private static string RowFingerprint(List<string> row)
+    {
+        // Footer rows: mostly empty cells with 1-2 non-empty (text + page number).
+        // Must have significantly fewer filled cells than the row width.
+        int nonEmpty = row.Count(c => !string.IsNullOrWhiteSpace(c));
+        int totalCols = row.Count;
+
+        // Footer: at most 2 non-empty cells, OR at most 30% fill rate for wider tables
+        if (nonEmpty > 2 || (totalCols > 0 && (double)nonEmpty / totalCols > 0.4))
+            return string.Empty;
+
+        if (nonEmpty == 0) return string.Empty;
+
+        var parts = row
+            .Select(c => c.Trim())
+            .Where(c => !string.IsNullOrWhiteSpace(c))
+            .Select(c => Regex.IsMatch(c, @"^\d{1,4}$") ? "##PAGE##" : c)
+            .ToList();
+
+        return string.Join("|", parts);
+    }
+
     private void MergeCrossPageTables(ExtractedDocument document)
     {
         // Track tables that received cross-page rows (need wrap re-merge)

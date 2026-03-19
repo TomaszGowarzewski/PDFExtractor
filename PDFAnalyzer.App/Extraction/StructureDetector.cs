@@ -128,20 +128,48 @@ public class StructureDetector
                 block.Add(lines[i]);
                 i++;
             }
-            else if (lines[i].Segments.Count == 1)
+            else if (lines[i].Segments.Count <= 1)
             {
-                // Allow wrapped text if it's short and between multi-segment lines
                 if (IsSectionHeader(lines[i]))
                     break;
 
-                string text = lines[i].Line.FullText.Trim();
-                bool nextIsMultiSeg = i + 1 < lines.Count && lines[i + 1].Segments.Count >= 2;
+                // Look ahead: collect consecutive single-segment lines and check if
+                // a multi-segment line follows within a reasonable distance.
+                // This handles multi-line cell wraps like:
+                //   "ASDASD,"   ← single
+                //   "ASDASD,"   ← single
+                //   "QWEQWEE,"  ← single
+                //   "QWEQWE"    ← single
+                //   "B" | "dqwes" | "4" | ...  ← multi (table continues!)
+                var pendingSingles = new List<AnnotatedLine>();
+                int lookahead = i;
+                bool foundMultiSeg = false;
 
-                if (nextIsMultiSeg && text.Length < 80)
+                while (lookahead < lines.Count && lines[lookahead].Segments.Count <= 1)
                 {
-                    // This is likely a wrapped cell - include it
-                    block.Add(lines[i]);
-                    i++;
+                    if (IsSectionHeader(lines[lookahead]))
+                        break;
+
+                    string text = lines[lookahead].Line.FullText.Trim();
+                    if (text.Length > 80) // too long for a wrapped cell
+                        break;
+
+                    pendingSingles.Add(lines[lookahead]);
+                    lookahead++;
+
+                    // Don't look too far ahead (max ~10 lines of wrapping)
+                    if (pendingSingles.Count > 10)
+                        break;
+                }
+
+                if (lookahead < lines.Count && lines[lookahead].Segments.Count >= 2)
+                    foundMultiSeg = true;
+
+                if (foundMultiSeg && block.Count > 0)
+                {
+                    // Include all pending single-segment lines as wrapped text
+                    block.AddRange(pendingSingles);
+                    i = lookahead;
                 }
                 else
                 {
