@@ -245,25 +245,9 @@ public class PdfDataExtractor
 
             if (nonEmpty > 0 && nonEmpty <= wrapThreshold && nonEmpty <= maxWrapCols)
             {
-                // This looks like a wrap. Verify: the non-empty cells should be in columns
-                // where the previous row also has values (the text was too long and wrapped).
                 var prevRow = table.Rows[r - 1];
-                bool allCellsAlignWithPrev = true;
 
-                for (int c = 0; c < row.Count; c++)
-                {
-                    if (!string.IsNullOrWhiteSpace(row[c]) && c < prevRow.Count)
-                    {
-                        // This column has wrap text - prev row should also have a value here
-                        if (string.IsNullOrWhiteSpace(prevRow[c]))
-                        {
-                            allCellsAlignWithPrev = false;
-                            break;
-                        }
-                    }
-                }
-
-                if (allCellsAlignWithPrev)
+                if (IsWrapContinuation(row, prevRow))
                 {
                     // Merge: append this row's cell text to the previous row
                     for (int c = 0; c < row.Count && c < prevRow.Count; c++)
@@ -282,6 +266,64 @@ public class PdfDataExtractor
                 }
             }
         }
+    }
+
+    /// <summary>
+    /// Determine if a candidate row is a wrap continuation of the previous row.
+    ///
+    /// WRAP: cells appear in columns where prev row has LONG or INCOMPLETE text.
+    ///   prev: "A" | "asdasd" | "2" | "65" | "123123123123" | "2" | "2" | "ASDASD,"
+    ///   cand: ""  | ""       | ""  | ""   | "123123"       | ""  | ""  | "ASDASD,"
+    ///         → col 4 prev=13 chars (long), col 7 prev ends with comma → WRAP ✓
+    ///
+    /// SUB-ROW: cells appear in columns where prev row has SHORT, COMPLETE values.
+    ///   prev: "A" | "asdasd" | "2" | "65" | "123123123123" | "2" | "2" | "ASDASD,"
+    ///   cand: ""  | ""       | "4" | "53" | "1235312354321" | "5" | "34"| "ASDASD,"
+    ///         → col 2 prev="2" (short number!), col 3 prev="65" (short number!) → SUB-ROW ✗
+    /// </summary>
+    private static bool IsWrapContinuation(List<string> candidateRow, List<string> prevRow)
+    {
+        // Minimum cell length in prev row to consider it "wrappable".
+        // Short values like "2", "65", "IT" (≤4 chars) are clearly complete.
+        // Longer values like "QWEQWE", "asdasd" (5+ chars) might have wrapped.
+        const int MinWrapSourceLength = 5;
+
+        int wrapLikelyCols = 0;
+        int subRowLikelyCols = 0;
+
+        for (int c = 0; c < candidateRow.Count; c++)
+        {
+            string candValue = candidateRow[c].Trim();
+            if (string.IsNullOrWhiteSpace(candValue)) continue;
+
+            string prevValue = c < prevRow.Count ? prevRow[c].Trim() : string.Empty;
+
+            if (string.IsNullOrWhiteSpace(prevValue))
+            {
+                // Candidate has value where prev is empty → NOT a wrap
+                return false;
+            }
+
+            // Check if the prev cell looks like it could have wrapped
+            bool prevIsLong = prevValue.Length >= MinWrapSourceLength;
+            bool prevEndsIncomplete = prevValue.EndsWith(",") || prevValue.EndsWith("-") ||
+                                      prevValue.EndsWith(";") || prevValue.EndsWith("\\");
+            bool prevIsMultiWord = prevValue.Contains(' ') || prevValue.Contains(',');
+
+            if (prevIsLong || prevEndsIncomplete || prevIsMultiWord)
+            {
+                wrapLikelyCols++;
+            }
+            else
+            {
+                // Prev cell is short and complete (e.g., "2", "65", "IT")
+                // → candidate value is a NEW value, not a wrap
+                subRowLikelyCols++;
+            }
+        }
+
+        // It's a wrap only if ALL non-empty cells align with wrappable prev cells
+        return wrapLikelyCols > 0 && subRowLikelyCols == 0;
     }
 
     private void MergeMultiLineHeaders(ExtractedTable table)
