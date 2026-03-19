@@ -61,6 +61,7 @@ public class PdfDataExtractor
             // Clean up tables: merge multi-line headers, remove empty columns
             foreach (var element in page.Elements.OfType<ExtractedTable>().ToList())
             {
+                MergeWrappedCellRows(element);
                 MergeMultiLineHeaders(element);
                 RemoveEmptyColumns(element);
             }
@@ -107,6 +108,87 @@ public class PdfDataExtractor
     ///   Row 2 (units):            "        | przych. zl    | (b-c) zl  | (c-b) zl      | przez pl. "
     ///   Row 3 (first DATA row):   "1. Nal. | 87 450,00     | 84 450,00 | -             | 7 812,00  "
     /// </summary>
+    /// <summary>
+    /// Merge rows that are actually wrapped cell text from the row above.
+    ///
+    /// A "wrapped continuation" row has very few non-empty cells compared to a full data row,
+    /// and those cells are in columns where the previous row had long text.
+    ///
+    /// Example:
+    ///   Row N:   "A" | "asdasd" | "2" | "65" | "123123123123" | "2" | "2"  | "ASDASD,ASD"
+    ///   Row N+1: ""  | ""       | ""  | ""   | "123123"       | ""  | ""   | "ASD,ASDASD"   ← wrap!
+    ///   Row N+2: ""  | ""       | "4" | "53" | "123531235432" | "5" | "34" | "ASDASD,ASD"   ← new sub-row
+    ///
+    /// Row N+1 has only 2 non-empty cells (vs 8 in a full row) → it's a wrap continuation.
+    /// Row N+2 has 6 non-empty cells → it's a real data row.
+    /// </summary>
+    private void MergeWrappedCellRows(ExtractedTable table)
+    {
+        if (table.Rows.Count < 2) return;
+
+        int colCount = table.Headers.Count;
+
+        // Compute the "full row" fill count using the 75th percentile.
+        // This is robust: even if half the rows are wraps, the upper quartile
+        // will still represent real data rows.
+        var fillCounts = table.Rows
+            .Select(r => r.Count(c => !string.IsNullOrWhiteSpace(c)))
+            .OrderBy(x => x)
+            .ToList();
+        int p75Fill = fillCounts[(int)(fillCounts.Count * 0.75)];
+
+        // A row is a wrap if it has less than half the cells of a full row.
+        // This cleanly separates wraps (1-3 cells) from data rows (5-8 cells).
+        double wrapThreshold = Math.Max(p75Fill * 0.50, 2);
+        int maxWrapCols = Math.Max(colCount / 2, 2);
+
+        // Process bottom-up so indices stay valid
+        for (int r = table.Rows.Count - 1; r >= 1; r--)
+        {
+            var row = table.Rows[r];
+            int nonEmpty = row.Count(c => !string.IsNullOrWhiteSpace(c));
+
+            if (nonEmpty > 0 && nonEmpty <= wrapThreshold && nonEmpty <= maxWrapCols)
+            {
+                // This looks like a wrap. Verify: the non-empty cells should be in columns
+                // where the previous row also has values (the text was too long and wrapped).
+                var prevRow = table.Rows[r - 1];
+                bool allCellsAlignWithPrev = true;
+
+                for (int c = 0; c < row.Count; c++)
+                {
+                    if (!string.IsNullOrWhiteSpace(row[c]) && c < prevRow.Count)
+                    {
+                        // This column has wrap text - prev row should also have a value here
+                        if (string.IsNullOrWhiteSpace(prevRow[c]))
+                        {
+                            allCellsAlignWithPrev = false;
+                            break;
+                        }
+                    }
+                }
+
+                if (allCellsAlignWithPrev)
+                {
+                    // Merge: append this row's cell text to the previous row
+                    for (int c = 0; c < row.Count && c < prevRow.Count; c++)
+                    {
+                        string text = row[c].Trim();
+                        if (!string.IsNullOrWhiteSpace(text))
+                        {
+                            if (string.IsNullOrWhiteSpace(prevRow[c]))
+                                prevRow[c] = text;
+                            else
+                                prevRow[c] = prevRow[c] + "\n" + text;
+                        }
+                    }
+
+                    table.Rows.RemoveAt(r);
+                }
+            }
+        }
+    }
+
     private void MergeMultiLineHeaders(ExtractedTable table)
     {
         // Collect all consecutive header-like rows from the top
