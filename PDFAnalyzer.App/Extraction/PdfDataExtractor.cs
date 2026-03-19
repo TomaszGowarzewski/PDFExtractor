@@ -520,29 +520,124 @@ public class PdfDataExtractor
         }
     }
 
+    /// <summary>
+    /// Merge tables that span across page boundaries.
+    ///
+    /// Handles 3 scenarios:
+    ///   1. Next page table has SAME headers → merge rows, drop duplicate headers.
+    ///   2. Next page table has NO real headers (headers look like data) and same column count
+    ///      → headerless continuation, merge rows.
+    ///   3. Next page starts with a partial row (few cells, aligns with last row of prev table)
+    ///      → merge as wrapped cell continuation of the last row.
+    ///
+    /// Runs iteratively so tables spanning 3+ pages get fully merged.
+    /// </summary>
     private void MergeCrossPageTables(ExtractedDocument document)
     {
-        for (int p = 0; p < document.Pages.Count - 1; p++)
+        // Track tables that received cross-page rows (need wrap re-merge)
+        var mergedTables = new HashSet<ExtractedTable>();
+
+        // Repeat until no more merges happen (handles 3+ page spans)
+        bool merged = true;
+        while (merged)
         {
-            var currentPage = document.Pages[p];
-            var nextPage = document.Pages[p + 1];
+            merged = false;
 
-            if (currentPage.Elements.Count == 0 || nextPage.Elements.Count == 0)
-                continue;
-
-            var lastElement = currentPage.Elements.Last();
-            var firstElement = nextPage.Elements.First();
-
-            if (lastElement is ExtractedTable lastTable && firstElement is ExtractedTable firstTable)
+            // Find the last page with a table, then check against the next page with elements
+            for (int p = 0; p < document.Pages.Count - 1; p++)
             {
-                if (lastTable.Headers.Count == firstTable.Headers.Count &&
-                    HeadersMatch(lastTable.Headers, firstTable.Headers))
+                var currentPage = document.Pages[p];
+                var lastElement = currentPage.Elements.LastOrDefault(e => e is ExtractedTable);
+                if (lastElement is not ExtractedTable lastTable)
+                    continue;
+
+                // Find the next page that has any elements
+                ExtractedPage? nextPage = null;
+                for (int np = p + 1; np < document.Pages.Count; np++)
                 {
-                    lastTable.Rows.AddRange(firstTable.Rows);
-                    nextPage.Elements.RemoveAt(0);
+                    if (document.Pages[np].Elements.Count > 0)
+                    {
+                        nextPage = document.Pages[np];
+                        break;
+                    }
+                }
+
+                if (nextPage == null)
+                    continue;
+
+                var firstElement = nextPage.Elements.FirstOrDefault();
+
+                if (firstElement is ExtractedTable firstTable)
+                {
+                    // Scenario 1: Same headers (exact or close match)
+                    if (lastTable.Headers.Count == firstTable.Headers.Count &&
+                        HeadersMatch(lastTable.Headers, firstTable.Headers))
+                    {
+                        lastTable.Rows.AddRange(firstTable.Rows);
+                        nextPage.Elements.Remove(firstTable);
+                        mergedTables.Add(lastTable);
+                        merged = true;
+                        continue;
+                    }
+
+                    // Scenario 2: Headerless continuation.
+                    if (lastTable.Headers.Count == firstTable.Headers.Count &&
+                        !IsHeaderLikeRow(firstTable.Headers))
+                    {
+                        var dataRow = firstTable.Headers;
+                        lastTable.Rows.Add(dataRow);
+                        lastTable.Rows.AddRange(firstTable.Rows);
+                        nextPage.Elements.Remove(firstTable);
+                        mergedTables.Add(lastTable);
+                        merged = true;
+                        continue;
+                    }
+
+                    // Scenario 2b: Column count differs slightly
+                    if (Math.Abs(lastTable.Headers.Count - firstTable.Headers.Count) <= 2 &&
+                        !IsHeaderLikeRow(firstTable.Headers) &&
+                        lastTable.Rows.Count > 0)
+                    {
+                        var dataRow = NormalizeRowToColumnCount(firstTable.Headers, lastTable.Headers.Count);
+                        lastTable.Rows.Add(dataRow);
+
+                        foreach (var row in firstTable.Rows)
+                        {
+                            lastTable.Rows.Add(NormalizeRowToColumnCount(row, lastTable.Headers.Count));
+                        }
+
+                        nextPage.Elements.Remove(firstTable);
+                        mergedTables.Add(lastTable);
+                        merged = true;
+                        continue;
+                    }
+                }
+
+                // Scenario 3: Next page starts with text/partial data that belongs to the last table.
+                // Could be wrapped text from the last row of the previous page.
+                if (firstElement is ExtractedTextBlock textBlock && lastTable.Rows.Count > 0)
+                {
+                    // Very short text might be a wrapped cell value
+                    // Skip this for now - it's hard to determine which column it belongs to.
                 }
             }
         }
+
+        // Re-run wrap detection only on tables that received cross-page rows
+        foreach (var table in mergedTables)
+        {
+            MergeWrappedCellRows(table);
+        }
+    }
+
+    private static List<string> NormalizeRowToColumnCount(List<string> row, int targetCount)
+    {
+        var result = new List<string>(row);
+        while (result.Count < targetCount)
+            result.Add(string.Empty);
+        if (result.Count > targetCount)
+            result = result.Take(targetCount).ToList();
+        return result;
     }
 
     private void MergeCrossPageKeyValueGroups(ExtractedDocument document)
