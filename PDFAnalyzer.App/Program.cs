@@ -1,36 +1,97 @@
 using Newtonsoft.Json;
 using Newtonsoft.Json.Converters;
+using PDFAnalyzer.App;
 using PDFAnalyzer.App.Export;
 using PDFAnalyzer.App.Extraction;
 using PDFAnalyzer.App.Models;
 
-if (args.Length == 0)
+if (args.Length == 0 || args.Contains("--help") || args.Contains("-h"))
 {
-    Console.WriteLine("Usage: PDFAnalyzer.App <pdf-file-path> [output-path]");
+    Console.WriteLine("Usage: PDFAnalyzer.App <pdf-file> [output-path] [options]");
     Console.WriteLine();
-    Console.WriteLine("  Extracts all structured data from a PDF document.");
-    Console.WriteLine("  Output format is determined by extension:");
-    Console.WriteLine("    .json  - JSON (default)");
-    Console.WriteLine("    .xlsx  - Excel workbook");
+    Console.WriteLine("  Output format by extension: .json (default) or .xlsx");
     Console.WriteLine();
-    Console.WriteLine("  Examples:");
-    Console.WriteLine("    PDFAnalyzer.App document.pdf                  -> document.json");
-    Console.WriteLine("    PDFAnalyzer.App document.pdf output.xlsx      -> output.xlsx");
-    Console.WriteLine("    PDFAnalyzer.App document.pdf output.json      -> output.json");
+    Console.WriteLine("Options:");
+    Console.WriteLine("  --mode <bordered|borderless>   Table extraction mode (default: bordered)");
+    Console.WriteLine("     bordered    = standard tables, each text line = one row");
+    Console.WriteLine("     borderless  = Y-gap analysis for tables with wrapped cell text");
+    Console.WriteLine();
+    Console.WriteLine("  --sensitivity <0.05-0.50>      Gap sensitivity for borderless mode (default: 0.15)");
+    Console.WriteLine("     Lower = more rows detected (stricter row separation)");
+    Console.WriteLine("     Higher = fewer rows (more text merged into cells)");
+    Console.WriteLine();
+    Console.WriteLine("  --min-cols <N>                 Min columns for new row in borderless mode (default: auto)");
+    Console.WriteLine("  --no-inherited                 Disable inherited-table detection");
+    Console.WriteLine("  --no-cross-page                Disable cross-page table merging");
+    Console.WriteLine("  --no-hierarchy                 Disable hierarchical header detection");
+    Console.WriteLine();
+    Console.WriteLine("Examples:");
+    Console.WriteLine("  PDFAnalyzer.App document.pdf");
+    Console.WriteLine("  PDFAnalyzer.App document.pdf output.xlsx --mode borderless");
+    Console.WriteLine("  PDFAnalyzer.App document.pdf out.json --mode borderless --sensitivity 0.10");
     return 1;
 }
 
+// Parse arguments
 string inputPath = args[0];
-string outputPath = args.Length > 1 ? args[1] : Path.ChangeExtension(inputPath, ".json");
+string outputPath = args.Length > 1 && !args[1].StartsWith("--")
+    ? args[1]
+    : Path.ChangeExtension(inputPath, ".json");
+
+var options = ExtractionOptions.Default;
+
+for (int i = 0; i < args.Length; i++)
+{
+    switch (args[i].ToLower())
+    {
+        case "--mode" when i + 1 < args.Length:
+            options = args[i + 1].ToLower() switch
+            {
+                "borderless" => ExtractionOptions.Borderless,
+                "bordered" => ExtractionOptions.Bordered,
+                _ => options
+            };
+            i++;
+            break;
+
+        case "--sensitivity" when i + 1 < args.Length:
+            if (double.TryParse(args[i + 1], System.Globalization.NumberStyles.Any,
+                    System.Globalization.CultureInfo.InvariantCulture, out double sens))
+                options.GapSensitivity = sens;
+            i++;
+            break;
+
+        case "--min-cols" when i + 1 < args.Length:
+            if (int.TryParse(args[i + 1], out int mc))
+                options.MinColumnsForNewRow = mc;
+            i++;
+            break;
+
+        case "--no-inherited":
+            options.DetectInheritedTables = false;
+            break;
+
+        case "--no-cross-page":
+            options.MergeCrossPageTables = false;
+            break;
+
+        case "--no-hierarchy":
+            options.DetectHierarchicalHeaders = false;
+            break;
+    }
+}
 
 try
 {
-    Console.WriteLine($"Extracting data from: {inputPath}");
+    Console.WriteLine($"Extracting: {inputPath}");
+    Console.WriteLine($"Mode: {options.RowDetection}" +
+        (options.RowDetection == RowDetectionMode.GapAnalysis
+            ? $" (sensitivity={options.GapSensitivity})"
+            : ""));
 
-    var extractor = new PdfDataExtractor();
+    var extractor = new PdfDataExtractor(options);
     var result = extractor.Extract(inputPath);
 
-    // Print summary
     int tables = 0, inheritedTables = 0, kvGroups = 0, formGrids = 0, textBlocks = 0;
     foreach (var page in result.Pages)
     {
@@ -47,51 +108,30 @@ try
         }
     }
 
-    Console.WriteLine($"\nExtraction complete!");
-    Console.WriteLine($"  Pages: {result.TotalPages}");
-    Console.WriteLine($"  Tables: {tables}");
-    Console.WriteLine($"  Inherited Tables: {inheritedTables}");
-    Console.WriteLine($"  Key-Value Groups: {kvGroups}");
-    Console.WriteLine($"  Form Grids: {formGrids}");
-    Console.WriteLine($"  Text Blocks: {textBlocks}");
+    Console.WriteLine($"\nDone! Pages: {result.TotalPages} | Tables: {tables} | Inherited: {inheritedTables} | KV: {kvGroups} | FormGrids: {formGrids} | Text: {textBlocks}");
 
-    // Export based on extension
+    // Export
     string extension = Path.GetExtension(outputPath).ToLowerInvariant();
+    var jsonSettings = new JsonSerializerSettings
+    {
+        Formatting = Formatting.Indented,
+        Converters = { new StringEnumConverter() },
+        NullValueHandling = NullValueHandling.Ignore
+    };
 
     if (extension == ".xlsx")
     {
-        var excelExporter = new ExcelExporter();
-        excelExporter.Export(result, outputPath);
-        Console.WriteLine($"\nExcel saved to: {outputPath}");
+        new ExcelExporter().Export(result, outputPath);
+        Console.WriteLine($"Excel: {outputPath}");
+
+        string jsonPath = Path.ChangeExtension(outputPath, ".json");
+        File.WriteAllText(jsonPath, JsonConvert.SerializeObject(result, jsonSettings));
+        Console.WriteLine($"JSON:  {jsonPath}");
     }
     else
     {
-        // JSON output (default)
-        var settings = new JsonSerializerSettings
-        {
-            Formatting = Formatting.Indented,
-            Converters = { new StringEnumConverter() },
-            NullValueHandling = NullValueHandling.Ignore
-        };
-        string json = JsonConvert.SerializeObject(result, settings);
-        File.WriteAllText(outputPath, json);
-        Console.WriteLine($"\nJSON saved to: {outputPath}");
-    }
-
-    // If only one output specified and it's xlsx, also generate json (or vice versa)
-    // Generate both if user wants
-    if (extension == ".xlsx")
-    {
-        string jsonPath = Path.ChangeExtension(outputPath, ".json");
-        var settings = new JsonSerializerSettings
-        {
-            Formatting = Formatting.Indented,
-            Converters = { new StringEnumConverter() },
-            NullValueHandling = NullValueHandling.Ignore
-        };
-        string json = JsonConvert.SerializeObject(result, settings);
-        File.WriteAllText(jsonPath, json);
-        Console.WriteLine($"JSON saved to: {jsonPath}");
+        File.WriteAllText(outputPath, JsonConvert.SerializeObject(result, jsonSettings));
+        Console.WriteLine($"JSON:  {outputPath}");
     }
 
     return 0;

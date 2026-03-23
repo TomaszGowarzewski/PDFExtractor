@@ -18,12 +18,15 @@ public class StructureDetector
     private readonly double _pageWidth;
     private readonly double _columnGapThreshold;
     private readonly HeaderFooterDetector? _headerFooterDetector;
+    private readonly ExtractionOptions _options;
 
-    public StructureDetector(double pageWidth, HeaderFooterDetector? headerFooterDetector = null)
+    public StructureDetector(double pageWidth, HeaderFooterDetector? headerFooterDetector = null,
+        ExtractionOptions? options = null)
     {
         _pageWidth = pageWidth;
         _columnGapThreshold = pageWidth * 0.03;
         _headerFooterDetector = headerFooterDetector;
+        _options = options ?? ExtractionOptions.Default;
     }
 
     public List<ExtractedElement> DetectStructures(List<PdfTextLine> lines, int pageNumber)
@@ -314,8 +317,80 @@ public class StructureDetector
         return kv;
     }
 
+    /// <summary>
+    /// Build table using Y-gap analysis for row detection (handles word-wrapped cells).
+    ///
+    /// Key insight from research: Y-gap distribution in tables with wrapped cells
+    /// is BIMODAL - small gaps within cells, large gaps between rows.
+    /// Finding the "largest jump" in sorted gaps gives the natural threshold.
+    ///
+    /// Two modes controlled by ExtractionOptions.RowDetection:
+    ///   MultiSegment: Each multi-seg line = row. Simple, safe, works for bordered tables.
+    ///   GapAnalysis:  Y-gap analysis for borderless tables with wrapped cells.
+    /// </summary>
     private ExtractedTable BuildTable(List<AnnotatedLine> block, string? sectionName,
         int pageNumber, double y)
+    {
+        if (_options.RowDetection == RowDetectionMode.MultiSegment)
+            return BuildTableMultiSeg(block, pageNumber, y);
+        else
+            return BuildTableGapAnalysis(block, pageNumber, y);
+    }
+
+    /// <summary>
+    /// MultiSegment mode: each multi-segment line = one row.
+    /// Single-segment lines = wrapped cell text, appended to previous row by X-column.
+    /// </summary>
+    private ExtractedTable BuildTableMultiSeg(List<AnnotatedLine> block, int pageNumber, double y)
+    {
+        var table = new ExtractedTable { PageNumber = pageNumber, Y = y };
+
+        var multiSegLines = block.Where(b => b.Segments.Count >= 2).ToList();
+        if (multiSegLines.Count == 0) return table;
+
+        var columns = DetectColumns(multiSegLines);
+        if (columns.Count < 2) return table;
+
+        // Build rows: multi-seg = new row, single-seg = append to column
+        var rows = new List<List<string>>();
+        List<string>? currentRow = null;
+
+        foreach (var line in block)
+        {
+            if (line.Segments.Count >= 2)
+            {
+                currentRow = AssignToColumns(line.Segments, columns);
+                rows.Add(currentRow);
+            }
+            else if (line.Segments.Count == 1 && currentRow != null)
+            {
+                string text = line.Line.FullText.Trim();
+                if (string.IsNullOrWhiteSpace(text)) continue;
+
+                int colIdx = FindNearestColumn(line.Segments[0].X, columns);
+                if (colIdx < currentRow.Count)
+                {
+                    if (string.IsNullOrWhiteSpace(currentRow[colIdx]))
+                        currentRow[colIdx] = text;
+                    else
+                        currentRow[colIdx] += "\n" + text;
+                }
+            }
+        }
+
+        if (rows.Count == 0) return table;
+        table.Headers = rows[0];
+        for (int i = 1; i < rows.Count; i++)
+            table.Rows.Add(rows[i]);
+
+        return table;
+    }
+
+    /// <summary>
+    /// GapAnalysis mode: Y-gap analysis for row boundaries.
+    /// Combined with column-occupancy signal for robust wrap vs new-row detection.
+    /// </summary>
+    private ExtractedTable BuildTableGapAnalysis(List<AnnotatedLine> block, int pageNumber, double y)
     {
         var table = new ExtractedTable
         {
@@ -329,51 +404,154 @@ public class StructureDetector
         var columns = DetectColumns(multiSegLines);
         if (columns.Count < 2) return table;
 
-        // First multi-segment line → header
-        table.Headers = AssignToColumns(multiSegLines[0].Segments, columns);
+        // Step 1: Build text lines - assign every segment to a column
+        var textLines = new List<(double Y, Dictionary<int, string> Cells)>();
 
-        // Remaining → rows
-        for (int i = 1; i < multiSegLines.Count; i++)
+        foreach (var line in block)
         {
-            table.Rows.Add(AssignToColumns(multiSegLines[i].Segments, columns));
+            var cells = new Dictionary<int, string>();
+            foreach (var seg in line.Segments)
+            {
+                int col = FindNearestColumn(seg.X, columns);
+                if (cells.ContainsKey(col))
+                    cells[col] += " " + seg.Text;
+                else
+                    cells[col] = seg.Text;
+            }
+            if (cells.Count > 0)
+                textLines.Add((line.Line.Y, cells));
         }
 
-        // Handle wrapped single-segment lines: find the row just before them and append
-        for (int b = 0; b < block.Count; b++)
+        if (textLines.Count == 0) return table;
+
+        // Step 2: Compute Y-gaps between consecutive lines
+        var gaps = new List<double>();
+        for (int i = 1; i < textLines.Count; i++)
         {
-            if (block[b].Segments.Count == 1)
+            double gap = Math.Abs(textLines[i - 1].Y - textLines[i].Y);
+            if (gap > 0.5)
+                gaps.Add(gap);
+        }
+
+        // Step 3: Find row threshold.
+        // The gap distribution is typically: ~11pt (intra-cell wrap) and ~15pt (inter-row).
+        // We need to find the boundary between these two modes.
+        //
+        // Strategy: find the first significant jump in sorted gaps.
+        // "Significant" = a jump that's >= 20% of the gap value (relative jump).
+        // This catches 11→14.7 (34% jump) but not 14.7→14.8 (0.7% jump).
+        double rowThreshold = 0;
+
+        if (gaps.Count >= 3)
+        {
+            var sortedGaps = gaps.OrderBy(g => g).Distinct().ToList();
+
+            if (sortedGaps.Count >= 2)
             {
-                string text = block[b].Line.FullText.Trim();
-                if (string.IsNullOrWhiteSpace(text)) continue;
-
-                // Find which row this belongs to (the multi-seg line just before it)
-                int rowIdx = -1;
-                for (int prev = b - 1; prev >= 0; prev--)
+                // Find the first significant relative jump in the lower portion of gaps
+                for (int i = 0; i < sortedGaps.Count - 1; i++)
                 {
-                    if (block[prev].Segments.Count >= 2)
+                    double relJump = (sortedGaps[i + 1] - sortedGaps[i]) / sortedGaps[i];
+                    if (relJump >= _options.GapSensitivity)
                     {
-                        int msIdx = multiSegLines.IndexOf(block[prev]);
-                        rowIdx = msIdx - 1; // -1 because first multiSegLine is headers
+                        rowThreshold = (sortedGaps[i] + sortedGaps[i + 1]) / 2.0;
                         break;
-                    }
-                }
-
-                if (rowIdx >= 0 && rowIdx < table.Rows.Count)
-                {
-                    int colIdx = FindNearestColumn(block[b].Segments[0].X, columns);
-                    var row = table.Rows[rowIdx];
-                    if (colIdx < row.Count)
-                    {
-                        if (string.IsNullOrEmpty(row[colIdx]))
-                            row[colIdx] = text;
-                        else
-                            row[colIdx] += " " + text;
                     }
                 }
             }
         }
 
+        // Step 4: Group text lines into logical rows.
+        // Combined signals:
+        //   - Gap > threshold → candidate for new row
+        //   - Column occupancy: a TRUE new row fills MANY columns (3+).
+        //     A wrap continuation fills only 1-2 columns.
+        //   - If gap > threshold AND line has 3+ columns filled → new row.
+        //   - If gap > threshold BUT line has ≤2 columns → wrap, merge.
+        //   - If gap <= threshold → always merge (same cell).
+        int minColsForNewRow = _options.MinColumnsForNewRow > 0
+            ? _options.MinColumnsForNewRow
+            : Math.Max(columns.Count / 3, 2);
+
+        var logicalRows = new List<Dictionary<int, string>>();
+        var currentRow = new Dictionary<int, string>(textLines[0].Cells);
+
+        for (int i = 1; i < textLines.Count; i++)
+        {
+            double gap = Math.Abs(textLines[i - 1].Y - textLines[i].Y);
+            int filledCols = textLines[i].Cells.Count(c => !string.IsNullOrWhiteSpace(c.Value));
+
+            bool isNewRow;
+            if (gap <= rowThreshold)
+            {
+                // Small gap: always merge (wrap within cell)
+                isNewRow = false;
+            }
+            else if (filledCols >= minColsForNewRow)
+            {
+                // Large gap AND many columns filled → real new row
+                isNewRow = true;
+            }
+            else
+            {
+                // Large gap BUT few columns → could be wrap or sub-row.
+                // Check if filled cells are in columns where current row has SHORT values
+                // (sub-row) vs LONG values (wrap).
+                bool hasShortPrevValues = false;
+                foreach (var (col, _) in textLines[i].Cells)
+                {
+                    if (currentRow.TryGetValue(col, out string? prev) &&
+                        !string.IsNullOrWhiteSpace(prev))
+                    {
+                        // Get the LAST line of prev value (in case it was already multi-line)
+                        var lastLine = prev.Split('\n').Last().Trim();
+                        if (lastLine.Length <= 4 && !lastLine.EndsWith(",") && !lastLine.EndsWith("-"))
+                        {
+                            hasShortPrevValues = true;
+                            break;
+                        }
+                    }
+                }
+
+                isNewRow = hasShortPrevValues;
+            }
+
+            if (isNewRow)
+            {
+                logicalRows.Add(currentRow);
+                currentRow = new Dictionary<int, string>(textLines[i].Cells);
+            }
+            else
+            {
+                // Merge: wrap within the same cell
+                foreach (var (col, text) in textLines[i].Cells)
+                {
+                    if (currentRow.TryGetValue(col, out string? existing) &&
+                        !string.IsNullOrEmpty(existing))
+                        currentRow[col] = existing + "\n" + text;
+                    else
+                        currentRow[col] = text;
+                }
+            }
+        }
+        logicalRows.Add(currentRow);
+
+        // Step 5: Convert to table format
+        if (logicalRows.Count == 0) return table;
+
+        table.Headers = RowDictToList(logicalRows[0], columns.Count);
+        for (int i = 1; i < logicalRows.Count; i++)
+            table.Rows.Add(RowDictToList(logicalRows[i], columns.Count));
+
         return table;
+    }
+
+    private static List<string> RowDictToList(Dictionary<int, string> rowDict, int colCount)
+    {
+        var list = new List<string>();
+        for (int c = 0; c < colCount; c++)
+            list.Add(rowDict.TryGetValue(c, out string? val) ? val ?? string.Empty : string.Empty);
+        return list;
     }
 
     private ExtractedFormGrid BuildFormGrid(List<AnnotatedLine> block, string? sectionName,

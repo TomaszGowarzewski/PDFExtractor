@@ -9,6 +9,15 @@ namespace PDFAnalyzer.App.Extraction;
 /// </summary>
 public class PdfDataExtractor
 {
+    private readonly ExtractionOptions _options;
+
+    public PdfDataExtractor() : this(ExtractionOptions.Default) { }
+
+    public PdfDataExtractor(ExtractionOptions options)
+    {
+        _options = options;
+    }
+
     public ExtractedDocument Extract(string filePath)
     {
         if (!File.Exists(filePath))
@@ -29,7 +38,6 @@ public class PdfDataExtractor
         var document = new ExtractedDocument { FileName = fileName };
         document.TotalPages = pdf.NumberOfPages;
 
-        // Pass 1: extract raw lines from all pages
         var allPageLines = new List<(List<PdfTextLine> Lines, double PageWidth)>();
         for (int pageNum = 1; pageNum <= pdf.NumberOfPages; pageNum++)
         {
@@ -37,15 +45,13 @@ public class PdfDataExtractor
             allPageLines.Add((PdfPageParser.ExtractLines(page), page.Width));
         }
 
-        // Pass 2: detect header/footer patterns across all pages
         var hfDetector = new HeaderFooterDetector();
         hfDetector.Analyze(allPageLines.Select(p => p.Lines).ToList());
 
-        // Pass 3: detect structures on each page (with header/footer filtering)
         for (int i = 0; i < allPageLines.Count; i++)
         {
             var (lines, pageWidth) = allPageLines[i];
-            var detector = new StructureDetector(pageWidth, hfDetector);
+            var detector = new StructureDetector(pageWidth, hfDetector, _options);
             var elements = detector.DetectStructures(lines, i + 1);
             document.Pages.Add(new ExtractedPage { PageNumber = i + 1, Elements = elements });
         }
@@ -76,7 +82,8 @@ public class PdfDataExtractor
         AbsorbOrphanTextBlocks(document);
 
         // Phase 4: Cross-page table merge (BEFORE inherited detection!)
-        MergeCrossPageTables(document);
+        if (_options.MergeCrossPageTables)
+            MergeCrossPageTables(document);
 
         // Phase 5: Per-page structure detection (now on fully merged tables)
         foreach (var page in document.Pages)
@@ -89,7 +96,8 @@ public class PdfDataExtractor
 
             MergeConsecutiveKeyValueGroups(page);
             MergeConsecutiveTextBlocks(page);
-            DetectInheritedTables(page);
+            if (_options.DetectInheritedTables)
+                DetectInheritedTables(page);
 
             // Remove empties
             page.Elements.RemoveAll(e =>
@@ -794,10 +802,18 @@ public class PdfDataExtractor
 
                 if (firstElement is ExtractedTable firstTable)
                 {
-                    // Scenario 1: Same headers (exact or close match)
+                    // Scenario 1: Same headers (exact or fuzzy match)
                     if (lastTable.Headers.Count == firstTable.Headers.Count &&
                         HeadersMatch(lastTable.Headers, firstTable.Headers))
                     {
+                        // Extract data that may be embedded in the continuation headers.
+                        // E.g., lastTable header = "Zakres", firstTable header = "Zakres\nBasic + bledy..."
+                        // The "\nBasic + bledy..." part is actually data from a wrapped row.
+                        var embeddedDataRow = ExtractEmbeddedHeaderData(
+                            lastTable.Headers, firstTable.Headers, lastTable.Headers.Count);
+                        if (embeddedDataRow != null)
+                            lastTable.Rows.Add(embeddedDataRow);
+
                         lastTable.Rows.AddRange(firstTable.Rows);
                         nextPage.Elements.Remove(firstTable);
                         mergedTables.Add(lastTable);
@@ -889,14 +905,70 @@ public class PdfDataExtractor
         }
     }
 
-    private bool HeadersMatch(List<string> h1, List<string> h2)
+    /// <summary>
+    /// Check if two header rows match (for cross-page merging).
+    /// Allows fuzzy matching: h2 header may contain h1 header as prefix/first line
+    /// (when wrapped data text got appended to the continuation page's header).
+    /// </summary>
+    private static bool HeadersMatch(List<string> h1, List<string> h2)
     {
-        for (int i = 0; i < h1.Count; i++)
+        for (int i = 0; i < h1.Count && i < h2.Count; i++)
         {
-            if (!string.IsNullOrWhiteSpace(h2[i]) &&
-                !h1[i].Equals(h2[i], StringComparison.OrdinalIgnoreCase))
-                return false;
+            string a = h1[i].Trim();
+            string b = h2[i].Trim();
+
+            if (string.IsNullOrWhiteSpace(b)) continue; // empty in h2 = ok
+            if (string.IsNullOrWhiteSpace(a)) continue; // empty in h1 = ok
+
+            if (a.Equals(b, StringComparison.OrdinalIgnoreCase)) continue; // exact
+
+            // Fuzzy: h2 starts with h1 (h1="Zakres", h2="Zakres\nBasic + bledy...")
+            if (b.StartsWith(a, StringComparison.OrdinalIgnoreCase)) continue;
+
+            // Fuzzy: first line of h2 matches h1
+            string bFirstLine = b.Split('\n')[0].Trim();
+            if (a.Equals(bFirstLine, StringComparison.OrdinalIgnoreCase)) continue;
+
+            return false;
         }
         return true;
+    }
+
+    /// <summary>
+    /// When a continuation page's headers contain embedded data (wrapped text from a row
+    /// that got mixed into the header), extract that data as a separate row.
+    ///
+    /// Example:
+    ///   Original header:     "Zakres"
+    ///   Continuation header: "Zakres\nBasic + bledy wazne, konsultacje\n8h/mies."
+    ///   Embedded data:       "Basic + bledy wazne, konsultacje\n8h/mies."
+    /// </summary>
+    private static List<string>? ExtractEmbeddedHeaderData(
+        List<string> originalHeaders, List<string> contHeaders, int colCount)
+    {
+        var dataRow = new List<string>();
+        bool hasData = false;
+
+        for (int c = 0; c < colCount; c++)
+        {
+            string orig = c < originalHeaders.Count ? originalHeaders[c].Trim() : "";
+            string cont = c < contHeaders.Count ? contHeaders[c].Trim() : "";
+
+            if (cont.Length > orig.Length && cont.StartsWith(orig, StringComparison.OrdinalIgnoreCase))
+            {
+                // Strip the original header text, keep the embedded data
+                string embedded = cont[orig.Length..].TrimStart('\n', '\r', ' ');
+                if (!string.IsNullOrWhiteSpace(embedded))
+                {
+                    dataRow.Add(embedded);
+                    hasData = true;
+                    continue;
+                }
+            }
+
+            dataRow.Add(string.Empty);
+        }
+
+        return hasData ? dataRow : null;
     }
 }
